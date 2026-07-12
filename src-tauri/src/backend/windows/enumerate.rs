@@ -30,6 +30,13 @@ pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
     snapshot_from_raw(RawTopologySnapshot { paths, modes })
 }
 
+/// Active-only snapshot without QDC_DATABASE_CURRENT enrichment. Used as the base for
+/// detach-only applies so database-sourced paths are never fed back into SetDisplayConfig.
+pub(super) fn query_active_only_topology() -> Result<TopologySnapshot, ManagerError> {
+    let (paths, modes) = query_raw_active()?;
+    snapshot_from_raw(RawTopologySnapshot { paths, modes })
+}
+
 pub(super) fn snapshot_from_raw(
     raw: RawTopologySnapshot,
 ) -> Result<TopologySnapshot, ManagerError> {

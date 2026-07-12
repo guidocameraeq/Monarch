@@ -5,8 +5,10 @@ use std::ffi::OsStr;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
-use std::process::Command;
+use std::process::{Child, Command, ExitStatus};
+use std::time::{Duration, Instant};
 
+use crate::diagnostics;
 use monarch::{Layout, ManagerError};
 use windows::core::BOOL;
 use windows::core::{w, PCWSTR};
@@ -122,15 +124,25 @@ pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
     // Some driver stacks reject direct topology-extend through SetDisplayConfig during
     // early-login / post-reboot states. Win+P still succeeds there, so fall back to the same
     // shell path via DisplaySwitch.
-    let display_switch_status = Command::new("DisplaySwitch.exe")
+    let display_switch_child = Command::new("DisplaySwitch.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .arg("/extend")
-        .status()
+        .spawn()
         .map_err(|err| {
             ManagerError::Backend(format!(
                 "SetDisplayConfig (topology extend) failed: {set_display_status}; DisplaySwitch /extend launch failed: {err}"
             ))
         })?;
+
+    let Some(display_switch_status) = wait_child_with_timeout(
+        display_switch_child,
+        "DisplaySwitch.exe",
+        Duration::from_secs(10),
+    ) else {
+        return Err(ManagerError::Backend(format!(
+            "SetDisplayConfig (topology extend) failed: {set_display_status}; DisplaySwitch /extend timed out"
+        )));
+    };
 
     if !display_switch_status.success() {
         return Err(ManagerError::Backend(format!(
@@ -257,14 +269,44 @@ fn best_effort_reload_color_calibration() {
 
     // Fallback: trigger Windows' built-in calibration loader task (may fail under standard user
     // task permissions on some machines; that's fine).
-    let _ = Command::new("schtasks.exe")
+    if let Ok(child) = Command::new("schtasks.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .args([
             "/Run",
             "/TN",
             r"\Microsoft\Windows\WindowsColorSystem\Calibration Loader",
         ])
-        .status();
+        .spawn()
+    {
+        let _ = wait_child_with_timeout(child, "schtasks.exe", Duration::from_secs(5));
+    }
+}
+
+/// Poll a child process in 100ms steps until it exits or the timeout elapses. On timeout the
+/// child is killed and `None` is returned, so a wedged helper process can never block an apply
+/// (and with it the global state mutex) indefinitely.
+fn wait_child_with_timeout(mut child: Child, name: &str, timeout: Duration) -> Option<ExitStatus> {
+    let poll_step = Duration::from_millis(100);
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status),
+            Ok(None) => {}
+            Err(err) => {
+                diagnostics::log(format!("child_wait:error:{name}:{err}"));
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            diagnostics::log(format!("child_wait:timeout:{name}"));
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(poll_step);
+    }
 }
 
 fn capture_active_gamma_ramps(snapshot: &TopologySnapshot) -> HashMap<(u64, u32), GammaRampWords> {
