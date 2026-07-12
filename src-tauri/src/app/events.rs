@@ -725,7 +725,7 @@ mod system_events {
                         diagnostics::log("system_resume:error:state_lock_failed");
                         return;
                     }
-                }
+                };
             }
             let _ = crate::app::shortcuts::sync_global_shortcuts(&app);
             super::refresh_tray_menu(&app);
