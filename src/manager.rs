@@ -296,11 +296,12 @@ where
         self.apply_layout(target_layout)
     }
 
-    /// Remap the desired layout onto the current enumeration and strictly validate it. When an
-    /// enabled output stays unresolved (e.g. a display detached before a reboot that database
-    /// enrichment failed to surface), give the backend one best-effort chance to re-expose
-    /// attachable targets — the equivalent of the user's manual Win+P extend — then re-fetch,
-    /// re-map and re-validate once before giving up with an actionable error.
+    /// Remap the desired layout onto the current enumeration and strictly validate it. An enabled
+    /// output that does not resolve names a display the backend is not enumerating at all, so
+    /// there is nothing to apply: the backend gets a chance to record why (it must not change the
+    /// topology — nothing it could do would make an absent display appear), and then the layout
+    /// is rejected with an actionable error. Attaching a display that IS enumerated but detached
+    /// needs none of this: it already resolves, and `apply_layout` attaches it.
     fn remap_and_resolve_for_apply(
         &self,
         target_layout: Layout,
@@ -317,11 +318,11 @@ where
         let mut current_layout = self.backend.get_layout()?;
         normalize_primary(&mut current_layout);
         let target_layout = remap_layout_display_ids(&target_layout, &current_layout);
-        self.ensure_outputs_resolve_after_attach_recovery(&target_layout, &current_layout)?;
+        self.ensure_outputs_resolve_or_report_disconnected(&target_layout, &current_layout)?;
         Ok((target_layout, current_layout))
     }
 
-    fn ensure_outputs_resolve_after_attach_recovery(
+    fn ensure_outputs_resolve_or_report_disconnected(
         &self,
         desired: &Layout,
         current: &Layout,
@@ -357,8 +358,10 @@ where
             })
             .map(|display| format!("'{}' ", display.friendly_name))
             .unwrap_or_default();
+        // This is NOT an attach failure: the display is not being enumerated at all (powered off,
+        // unplugged, or reported unavailable). Say so, instead of blaming a rescue that never ran.
         Err(ManagerError::Validation(format!(
-            "display {friendly}(target_id={}, edid_hash={edid_hash}) could not be found even after forcing a topology extend. reconnect it or attach it once from Windows Display settings",
+            "display {friendly}(target_id={}, edid_hash={edid_hash}) is not connected right now: Windows does not report it as an available display. turn it on or reconnect it and try again, or re-save the profile without it",
             unresolved.display_id.target_id
         )))
     }
@@ -962,11 +965,13 @@ mod tests {
         (manager, backend, store)
     }
 
-    /// Mock wrapper that counts `prepare_attach_targets` calls and can simulate apply failures.
+    /// Mock wrapper that counts `prepare_attach_targets` and `apply_layout` calls (the latter is
+    /// the core-visible proxy for "the topology was touched") and can simulate apply failures.
     #[derive(Clone)]
     struct CountingBackend {
         inner: MockBackend,
         prepare_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        apply_calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         fail_apply: std::sync::Arc<std::sync::atomic::AtomicBool>,
     }
 
@@ -975,12 +980,17 @@ mod tests {
             Self {
                 inner,
                 prepare_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                apply_calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 fail_apply: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
 
         fn prepare_calls(&self) -> usize {
             self.prepare_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn apply_calls(&self) -> usize {
+            self.apply_calls.load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn set_fail_apply(&self, fail: bool) {
@@ -999,6 +1009,8 @@ mod tests {
         }
 
         fn apply_layout(&self, layout: Layout) -> Result<(), ManagerError> {
+            self.apply_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if self.fail_apply.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(ManagerError::Backend("simulated apply failure".to_string()));
             }
@@ -1267,7 +1279,7 @@ mod tests {
         assert!(matches!(
             err,
             ManagerError::Validation(message)
-                if message.contains("could not be found even after forcing a topology extend")
+                if message.contains("is not connected right now")
         ));
     }
 
@@ -1469,7 +1481,7 @@ mod tests {
         assert!(matches!(
             err,
             ManagerError::Validation(message)
-                if message.contains("could not be found even after forcing a topology extend")
+                if message.contains("is not connected right now")
         ));
     }
 
@@ -1579,7 +1591,7 @@ mod tests {
         assert!(matches!(
             err,
             ManagerError::Validation(message)
-                if message.contains("could not be found even after forcing a topology extend")
+                if message.contains("is not connected right now")
         ));
     }
 
@@ -1692,6 +1704,51 @@ mod tests {
     }
 
     #[test]
+    fn apply_profile_does_not_touch_topology_when_display_is_not_connected() {
+        // Field case: after a resume, Windows reported one of the monitors with
+        // targetAvailable=FALSE, so it was not enumerated at all. Applying a profile that wants
+        // it must NOT change the topology — the old code forced a topology extend here, which
+        // attached every connected-inactive display (including a TV the very same profile asks to
+        // detach), stalled 3.5s and failed anyway. An absent display is not an attach failure.
+        let backend =
+            CountingBackend::new(MockBackend::new(sample_displays(), sample_layout()).unwrap());
+        let store = MemoryConfigStore::new(AppConfig {
+            profiles: vec![Profile {
+                name: "PC".to_string(),
+                layout: Layout {
+                    outputs: vec![
+                        profile_output(sample_display_id(1), 0, true),
+                        // A monitor Windows is not enumerating right now.
+                        profile_output(
+                            DisplayId {
+                                adapter_luid: 1,
+                                target_id: 4353,
+                                edid_hash: Some(0xa8c7_f832_281a_39c5),
+                            },
+                            1920,
+                            false,
+                        ),
+                    ],
+                },
+            }],
+            ..AppConfig::default()
+        });
+        let mut manager = MonarchDisplayManager::new(backend.clone(), store).unwrap();
+
+        let err = manager.apply_profile("PC").unwrap_err();
+        assert!(
+            matches!(&err, ManagerError::Validation(message) if message.contains("is not connected right now")),
+            "expected the not-connected diagnosis, got: {err}"
+        );
+        assert_eq!(
+            backend.apply_calls(),
+            0,
+            "an absent display must never trigger a topology change"
+        );
+        assert!(!manager.has_pending_confirmation());
+    }
+
+    #[test]
     fn apply_profile_calls_prepare_attach_targets_when_outputs_are_unresolved() {
         let backend =
             CountingBackend::new(MockBackend::new(sample_displays(), sample_layout()).unwrap());
@@ -1721,7 +1778,7 @@ mod tests {
         assert!(matches!(
             err,
             ManagerError::Validation(message)
-                if message.contains("could not be found even after forcing a topology extend")
+                if message.contains("is not connected right now")
         ));
         assert_eq!(backend.prepare_calls(), 1);
     }

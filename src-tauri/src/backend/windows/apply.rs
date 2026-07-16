@@ -129,10 +129,17 @@ pub fn apply_layout_against_snapshot(
 /// What SDC_VALIDATE probes actually established (on a single-display machine):
 ///   active paths + supplied mode array, one path with invalid mode indices -> accepted
 ///   every path with invalid mode indices + NULL mode array                 -> 87, always
-/// so the mode-less shape is a parameter-level rejection and is not attempted. NOT VERIFIED:
-/// appending the path of a currently INACTIVE target — the exact operation below — because that
-/// machine has no connected-but-inactive target to try it on. The mandatory SDC_VALIDATE dry-run
-/// before every apply is what covers this gap at runtime.
+/// so the mode-less shape is a parameter-level rejection and is not attempted.
+///
+/// Appending the path of a currently INACTIVE target — the exact operation below — could not be
+/// probed there (that machine has no connected-but-inactive target), but a field log since
+/// confirmed it on real hardware: a TV detached before an app restart, on a 3-display desktop,
+/// came back on the first poll.
+///   recover:explicit_attach:'Smart TV Pro' (target_id=4352, ...):source=2:validate=0
+///   recover:explicit_attach:batch=1:apply=0
+///   recover:settle_poll:attach:1:missing=0
+/// The mandatory SDC_VALIDATE dry-run before every apply still gates each attempt at runtime:
+/// one machine agreeing is not every driver agreeing.
 ///
 /// Returns an empty vec when there are no active paths to build on.
 pub(super) fn build_attach_paths(

@@ -122,58 +122,53 @@ impl WindowsDisplayBackend {
         Ok(())
     }
 
-    /// Best-effort recovery used by the manager before rejecting a profile/restore whose enabled
-    /// outputs cannot be resolved against the current enumeration (e.g. detached before a reboot
-    /// and QDC_DATABASE_CURRENT enrichment failed to surface it): force a topology extend — the
-    /// same action as the user's manual Win+P workaround — so Windows recreates the paths, then
-    /// invalidate the cache so the next query re-enumerates fresh. Extend failures are swallowed
-    /// on purpose: the caller's strict re-validation reports the real error.
+    /// Diagnostic hook the manager calls before rejecting a profile/restore whose enabled outputs
+    /// do not resolve. It deliberately does NOT touch the topology: nothing it could do would
+    /// help, so all it does is record WHY the display is unusable.
+    ///
+    /// Why no rescue is possible here: resolving means the display is ENUMERATED, not that it is
+    /// active. The QDC_ALL_PATHS seeder already puts every connected-but-detached display in the
+    /// layout (as `is_active=false`), so anything attachable already resolves; conversely an
+    /// output that does NOT resolve names a display Windows is not enumerating at all — powered
+    /// off, unplugged, or reported with `targetAvailable=FALSE`. Neither rescue can conjure that:
+    /// an explicit attach only raises the ACTIVE flag on a path that must already exist, and
+    /// SDC_TOPOLOGY_EXTEND replays the persistence database. (Attaching a display that is
+    /// enumerated under a different identity than the profile expects would not make the profile
+    /// resolve either — it would just move the user's screens for nothing.)
+    ///
+    /// This used to force an extend. In the field that only produced an unrequested topology flip
+    /// — attaching every connected-inactive display, including a TV the user had just asked the
+    /// profile to DETACH — plus a 3.5s stall, before failing anyway with ERROR_GEN_FAILURE.
     pub fn prepare_attach_targets(&self, desired: &Layout) -> Result<(), ManagerError> {
-        if !layout_has_unresolved_enabled_output(desired, &query_active_topology()?) {
+        let snapshot = query_active_topology()?;
+        let unresolved = unresolved_enabled_outputs(desired, &snapshot);
+        if unresolved.is_empty() {
             return Ok(());
         }
 
-        // The extend attaches every connected-inactive display and persists that, so a rollback
-        // net is a hard precondition here too: without one, do not touch the topology at all and
-        // let the caller's strict re-validation report the real error.
-        let Ok(pre_extend) = capture_pre_recovery_state() else {
-            diagnostics::log("prepare_attach_targets:abort:no_pre_state_captured");
-            return Ok(());
-        };
-        diagnostics::log("prepare_attach_targets:force_extend");
-        try_topology_extend();
-
-        // Poll rather than sleep once: a TV/HDMI handshake after an extend can outlast a fixed
-        // settle, and the display may return under a different (adapter_luid, target_id). The
-        // extend's own status cannot judge success (0 is also a no-op), so observation decides.
-        let deadline = std::time::Instant::now() + RECOVER_SETTLE_DEADLINE;
-        let mut attempt = 0usize;
-        loop {
-            attempt += 1;
-            std::thread::sleep(RECOVER_SETTLE_STEP);
-            let snapshot = match query_active_topology() {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    // Never leave the extend applied on the way out.
-                    restore_pre_extend_topology(&pre_extend);
-                    let _ = self.invalidate_cache();
-                    return Err(error);
-                }
-            };
-            let unresolved = layout_has_unresolved_enabled_output(desired, &snapshot);
-            diagnostics::log(format!(
-                "prepare_attach_targets:settle_poll:{attempt}:unresolved={unresolved}"
-            ));
-            if !unresolved {
-                return self.invalidate_cache();
-            }
-            if std::time::Instant::now() >= deadline {
-                // The extend did not expose the display: undo its collateral and let the
-                // caller's strict re-validation report the real, actionable error.
-                restore_pre_extend_topology(&pre_extend);
-                return self.invalidate_cache();
+        let used_source_keys = active_source_keys(&snapshot);
+        for output in &unresolved {
+            let description = describe_output_for_error(output, &snapshot);
+            let candidates = select_attach_candidates(
+                &snapshot.attachable,
+                &output.display_id,
+                &used_source_keys,
+            );
+            if candidates.is_empty() {
+                diagnostics::log(format!(
+                    "prepare_attach_targets:no_candidate:{description}:skip_extend"
+                ));
+            } else {
+                // Canary: an attach candidate for an output that does not resolve means the
+                // connector now carries a display with a different identity than the profile
+                // expects (its EDID changed). Attaching it would not make the profile resolve,
+                // so the topology is still left alone.
+                diagnostics::log(format!(
+                    "prepare_attach_targets:candidate_for_unresolved_output:{description}:skip_extend"
+                ));
             }
         }
+        Ok(())
     }
 
     fn refresh_active(&self) -> Result<(), ManagerError> {
@@ -343,9 +338,12 @@ fn cached_id_is_stale_duplicate<'a>(
     })
 }
 
-/// Whether any enabled output of `desired` fails to resolve against `snapshot`'s enumeration
-/// after remapping — the same criterion the manager uses before rejecting a profile/restore.
-fn layout_has_unresolved_enabled_output(desired: &Layout, snapshot: &TopologySnapshot) -> bool {
+/// Enabled outputs of `desired` that fail to resolve against `snapshot`'s enumeration after
+/// remapping — the same criterion the manager uses before rejecting a profile/restore.
+fn unresolved_enabled_outputs(
+    desired: &Layout,
+    snapshot: &TopologySnapshot,
+) -> Vec<monarch::OutputConfig> {
     let remapped = remap_layout_display_ids_for_snapshot(
         desired,
         &snapshot.layout,
@@ -359,8 +357,9 @@ fn layout_has_unresolved_enabled_output(desired: &Layout, snapshot: &TopologySna
         .collect();
     remapped
         .outputs
-        .iter()
-        .any(|output| output.enabled && !current_ids.contains(&output.display_id))
+        .into_iter()
+        .filter(|output| output.enabled && !current_ids.contains(&output.display_id))
+        .collect()
 }
 
 /// True for an inactive entry with no usable geometry: the 0x0 sentinel the ALL_PATHS seeder
