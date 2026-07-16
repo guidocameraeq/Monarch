@@ -35,7 +35,7 @@ const mockListeners = new Map<string, Set<MockListener>>();
 const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
 const useWebMock =
   (viteEnv?.VITE_MONARCH_WEB_MOCK ?? "") === "1" || !isTauriRuntime();
-// Fork release tags MUST be >= v1.51.0: this build is 1.51.x, and the numeric comparison below
+// Fork release tags MUST be >= v51.0.0: this build is 51.x, and the numeric comparison below
 // would report "up to date" against any lower tag (e.g. an upstream-style v1.6.x).
 const GITHUB_RELEASES_LATEST_API =
   "https://api.github.com/repos/guidocameraeq/Monarch/releases/latest";

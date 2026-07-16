@@ -10,6 +10,7 @@ import {
 import { TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { openExternalUrl } from "@/tauri";
 import { REPO_URL, VIEW_OPTIONS } from "@/app/ui";
+import packageJson from "../../../package.json";
 
 export function AppHeader() {
   return (
@@ -19,7 +20,7 @@ export function AppHeader() {
           <CardTitle className="tracking-widest text-primary">
             MONARCH{" "}
             <span className="text-sm font-normal tracking-normal text-muted-foreground">
-              (personal)
+              (personal) v{packageJson.version}
             </span>
           </CardTitle>
           <CardDescription className="max-w-3xl text-sm leading-relaxed sm:text-base">

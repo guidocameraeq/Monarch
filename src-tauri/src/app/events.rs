@@ -270,7 +270,7 @@ fn topology_watch_signature<R: Runtime>(app: &AppHandle<R>) -> Result<String, St
 pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let menu = build_tray_menu(app)?;
     let mut tray_builder = TrayIconBuilder::with_id("monarch-tray")
-        .tooltip("Monarch (personal)")
+        .tooltip(concat!("Monarch (personal) v", env!("CARGO_PKG_VERSION")))
         .menu(&menu)
         .on_menu_event({
             let app = app.clone();
