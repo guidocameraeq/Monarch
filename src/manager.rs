@@ -1584,6 +1584,114 @@ mod tests {
     }
 
     #[test]
+    fn apply_profile_hashless_legacy_output_remaps_to_seeded_inactive_display() {
+        // Field case (Guido's TV): a legacy profile entry saved without edid_hash by an old
+        // build, while the detached TV exists only as an ALL_PATHS-seeded inactive display
+        // under the current adapter LUID. The hash-less target_id fallback must accept the
+        // seeded candidate (Some(hash) on the candidate, None on the request) and remap.
+        let primary_id = DisplayId {
+            adapter_luid: 9,
+            target_id: 1,
+            edid_hash: Some(1),
+        };
+        let seeded_tv_id = DisplayId {
+            adapter_luid: 9,
+            target_id: 4352,
+            edid_hash: Some(77),
+        };
+        let displays = vec![
+            DisplayInfo {
+                id: primary_id.clone(),
+                friendly_name: "Primary".to_string(),
+                is_active: true,
+                is_primary: true,
+                resolution: Resolution {
+                    width: 1920,
+                    height: 1080,
+                },
+                refresh_rate_mhz: 60_000,
+            },
+            DisplayInfo {
+                id: seeded_tv_id.clone(),
+                friendly_name: "TV".to_string(),
+                is_active: false,
+                is_primary: false,
+                resolution: Resolution {
+                    width: 0,
+                    height: 0,
+                },
+                refresh_rate_mhz: 60_000,
+            },
+        ];
+        let layout = Layout {
+            outputs: vec![
+                OutputConfig {
+                    display_id: primary_id,
+                    enabled: true,
+                    position: Position { x: 0, y: 0 },
+                    resolution: Resolution {
+                        width: 1920,
+                        height: 1080,
+                    },
+                    refresh_rate_mhz: 60_000,
+                    primary: true,
+                },
+                OutputConfig {
+                    display_id: seeded_tv_id.clone(),
+                    enabled: false,
+                    position: Position { x: 0, y: 0 },
+                    resolution: Resolution {
+                        width: 0,
+                        height: 0,
+                    },
+                    refresh_rate_mhz: 60_000,
+                    primary: false,
+                },
+            ],
+        };
+        let backend = MockBackend::new(displays, layout).unwrap();
+        let store = MemoryConfigStore::new(AppConfig {
+            profiles: vec![Profile {
+                name: "couch".to_string(),
+                layout: Layout {
+                    outputs: vec![
+                        profile_output(
+                            DisplayId {
+                                adapter_luid: 1,
+                                target_id: 1,
+                                edid_hash: None,
+                            },
+                            0,
+                            true,
+                        ),
+                        profile_output(
+                            DisplayId {
+                                adapter_luid: 1,
+                                target_id: 4352,
+                                edid_hash: None,
+                            },
+                            1920,
+                            false,
+                        ),
+                    ],
+                },
+            }],
+            ..AppConfig::default()
+        });
+        let mut manager = MonarchDisplayManager::new(backend.clone(), store).unwrap();
+
+        manager.apply_profile("couch").unwrap();
+
+        let applied = backend.current_layout().unwrap();
+        let tv = applied
+            .outputs
+            .iter()
+            .find(|output| output.display_id == seeded_tv_id)
+            .expect("expected TV output remapped to the seeded display");
+        assert!(tv.enabled);
+    }
+
+    #[test]
     fn apply_profile_calls_prepare_attach_targets_when_outputs_are_unresolved() {
         let backend =
             CountingBackend::new(MockBackend::new(sample_displays(), sample_layout()).unwrap());

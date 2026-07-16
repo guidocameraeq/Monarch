@@ -51,6 +51,7 @@ pub fn spawn_confirmation_watchdog<R: Runtime>(app: AppHandle<R>, timeout: Durat
         match guard.manager.rollback_if_confirmation_expired() {
             Ok(true) => {
                 drop(guard);
+                diagnostics::log("confirm_watchdog:rolled_back:timeout");
                 refresh_tray_menu(&app);
                 emit_state_changed(&app);
                 emit_confirmation(
@@ -61,8 +62,9 @@ pub fn spawn_confirmation_watchdog<R: Runtime>(app: AppHandle<R>, timeout: Durat
                 );
             }
             Ok(false) => {}
-            Err(_) => {
+            Err(err) => {
                 drop(guard);
+                diagnostics::log(format!("confirm_watchdog:rollback_error:{err}"));
                 emit_confirmation(
                     &app,
                     ConfirmationEvent::Reverted {
@@ -268,7 +270,7 @@ fn topology_watch_signature<R: Runtime>(app: &AppHandle<R>) -> Result<String, St
 pub fn build_tray<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     let menu = build_tray_menu(app)?;
     let mut tray_builder = TrayIconBuilder::with_id("monarch-tray")
-        .tooltip("Monarch")
+        .tooltip("Monarch (personal)")
         .menu(&menu)
         .on_menu_event({
             let app = app.clone();

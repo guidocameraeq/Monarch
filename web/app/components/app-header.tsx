@@ -17,7 +17,10 @@ export function AppHeader() {
       <CardHeader className="gap-4 lg:flex-row lg:items-start lg:justify-between">
         <div className="space-y-2">
           <CardTitle className="tracking-widest text-primary">
-            MONARCH
+            MONARCH{" "}
+            <span className="text-sm font-normal tracking-normal text-muted-foreground">
+              (personal)
+            </span>
           </CardTitle>
           <CardDescription className="max-w-3xl text-sm leading-relaxed sm:text-base">
             Detach, restore, and switch monitor layouts without touching cables.

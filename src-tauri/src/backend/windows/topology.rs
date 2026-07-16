@@ -113,33 +113,54 @@ impl WindowsDisplayBackend {
     /// invalidate the cache so the next query re-enumerates fresh. Extend failures are swallowed
     /// on purpose: the caller's strict re-validation reports the real error.
     pub fn prepare_attach_targets(&self, desired: &Layout) -> Result<(), ManagerError> {
-        let snapshot = query_active_topology()?;
-        let remapped = remap_layout_display_ids_for_snapshot(
-            desired,
-            &snapshot.layout,
-            &raw_path_connectors(&snapshot.raw),
-        );
-        let current_ids: HashSet<DisplayId> = snapshot
-            .layout
-            .outputs
-            .iter()
-            .map(|output| output.display_id.clone())
-            .collect();
-        let needs_extend = remapped
-            .outputs
-            .iter()
-            .any(|output| output.enabled && !current_ids.contains(&output.display_id));
-        if !needs_extend {
+        if !layout_has_unresolved_enabled_output(desired, &query_active_topology()?) {
             return Ok(());
         }
 
+        // Capture the pre-extend topology so a fruitless extend can be undone: it attaches every
+        // connected-inactive display with SDC_SAVE_TO_DATABASE, which would silently become the
+        // user's persisted topology if we bailed out without restoring.
+        let pre_extend = query_active_only_topology().ok();
         diagnostics::log("prepare_attach_targets:force_extend");
         if let Err(error) = force_topology_extend() {
             diagnostics::log(format!("prepare_attach_targets:extend_failed:{error}"));
             return Ok(());
         }
-        std::thread::sleep(std::time::Duration::from_millis(700));
-        self.invalidate_cache()
+
+        // Poll rather than sleep once: a TV/HDMI handshake after an extend can outlast a fixed
+        // settle, and the display may return under a different (adapter_luid, target_id).
+        let deadline = std::time::Instant::now() + RECOVER_SETTLE_DEADLINE;
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            std::thread::sleep(RECOVER_SETTLE_STEP);
+            let snapshot = match query_active_topology() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    // Never leave the extend applied on the way out.
+                    if let Some(pre_extend) = &pre_extend {
+                        restore_pre_extend_topology(pre_extend);
+                    }
+                    let _ = self.invalidate_cache();
+                    return Err(error);
+                }
+            };
+            let unresolved = layout_has_unresolved_enabled_output(desired, &snapshot);
+            diagnostics::log(format!(
+                "prepare_attach_targets:settle_poll:{attempt}:unresolved={unresolved}"
+            ));
+            if !unresolved {
+                return self.invalidate_cache();
+            }
+            if std::time::Instant::now() >= deadline {
+                // The extend did not expose the display: undo its collateral and let the
+                // caller's strict re-validation report the real, actionable error.
+                if let Some(pre_extend) = &pre_extend {
+                    restore_pre_extend_topology(pre_extend);
+                }
+                return self.invalidate_cache();
+            }
+        }
     }
 
     fn refresh_active(&self) -> Result<(), ManagerError> {
@@ -307,6 +328,36 @@ fn cached_id_is_stale_duplicate<'a>(
     })
 }
 
+/// Whether any enabled output of `desired` fails to resolve against `snapshot`'s enumeration
+/// after remapping — the same criterion the manager uses before rejecting a profile/restore.
+fn layout_has_unresolved_enabled_output(desired: &Layout, snapshot: &TopologySnapshot) -> bool {
+    let remapped = remap_layout_display_ids_for_snapshot(
+        desired,
+        &snapshot.layout,
+        &raw_path_connectors(&snapshot.raw),
+    );
+    let current_ids: HashSet<DisplayId> = snapshot
+        .layout
+        .outputs
+        .iter()
+        .map(|output| output.display_id.clone())
+        .collect();
+    remapped
+        .outputs
+        .iter()
+        .any(|output| output.enabled && !current_ids.contains(&output.display_id))
+}
+
+/// True for an inactive entry with no usable geometry: the 0x0 sentinel the ALL_PATHS seeder
+/// emits for connected-but-detached displays, whose real geometry Windows does not report.
+fn output_is_geometry_sentinel(output: &monarch::OutputConfig) -> bool {
+    !output.enabled && output.resolution.width == 0 && output.resolution.height == 0
+}
+
+fn display_is_geometry_sentinel(display: &DisplayInfo) -> bool {
+    !display.is_active && display.resolution.width == 0 && display.resolution.height == 0
+}
+
 fn merge_layout_with_fresh(
     previous: Option<&Layout>,
     fresh: &Layout,
@@ -335,6 +386,13 @@ fn merge_layout_with_fresh(
             let mut next = active.clone();
             if next.display_id.edid_hash.is_none() {
                 next.display_id.edid_hash = cached.display_id.edid_hash;
+            }
+            // A seeded inactive entry carries no geometry (0x0 sentinel): keep the last real
+            // geometry we knew for this connector instead of overwriting it every refresh.
+            if output_is_geometry_sentinel(&next) && !output_is_geometry_sentinel(cached) {
+                next.position = cached.position.clone();
+                next.resolution = cached.resolution.clone();
+                next.refresh_rate_mhz = cached.refresh_rate_mhz;
             }
             next
         } else {
@@ -407,6 +465,12 @@ fn merge_displays_with_fresh(
             let mut next = active.clone();
             if next.id.edid_hash.is_none() {
                 next.id.edid_hash = cached.id.edid_hash;
+            }
+            // Seeded inactive entries carry the 0x0 sentinel: keep the last real geometry known
+            // for this connector so the UI does not flip to 0x0 on every refresh tick.
+            if display_is_geometry_sentinel(&next) && !display_is_geometry_sentinel(cached) {
+                next.resolution = cached.resolution.clone();
+                next.refresh_rate_mhz = cached.refresh_rate_mhz;
             }
             next
         } else {
@@ -514,22 +578,18 @@ impl DisplayBackend for WindowsDisplayBackend {
             enabled_outputs_missing_from_raw(&working_layout, &base_snapshot.raw);
         let (next_snapshot, applied_layout) = if !missing_attach_outputs.is_empty() {
             // The base snapshot has no path for these outputs, so flipping active flags would be
-            // a silent no-op (SetDisplayConfig returns 0 on an unchanged active set). If the
-            // display is currently connected, force an extend so Windows recreates its path and
-            // retry once; otherwise fail with an actionable error instead of applying a no-op.
-            if let Some(unavailable) = missing_attach_outputs
-                .iter()
-                .find(|output| !output_connected_in_snapshot(output, &active_snapshot))
-            {
-                let description = describe_output_for_error(unavailable, &base_snapshot);
+            // a silent no-op (SetDisplayConfig returns 0 on an unchanged active set). Force a
+            // topology extend UNCONDITIONALLY and retry once: a "is it connected?" guard here
+            // would rely on the same enumeration that just failed to surface the display,
+            // blocking exactly the case it must cure (detached display missing from the database
+            // query). The cost for a genuinely absent monitor is one harmless extend attempt
+            // followed by the same precise error from the retry validation.
+            for output in &missing_attach_outputs {
                 diagnostics::log(format!(
-                    "topology_apply:error:attach_target_not_connected:{description}"
+                    "recover:extend_attempt:{}",
+                    describe_output_for_error(output, &base_snapshot)
                 ));
-                return Err(ManagerError::Backend(format!(
-                    "cannot attach display {description}: it is not currently connected to this system"
-                )));
             }
-            diagnostics::log("topology_apply:retry:reason=attach_paths_missing");
             recover_apply_with_topology_extend(&working_layout)?
         } else {
             match apply_layout_against_snapshot(&working_layout, &base_snapshot) {
@@ -783,22 +843,6 @@ fn enabled_outputs_missing_from_raw<'a>(
         .collect()
 }
 
-fn output_connected_in_snapshot(
-    output: &monarch::OutputConfig,
-    snapshot: &TopologySnapshot,
-) -> bool {
-    if let Some(edid_hash) = output.display_id.edid_hash {
-        return snapshot
-            .displays
-            .iter()
-            .any(|display| display.id.edid_hash == Some(edid_hash));
-    }
-    snapshot.displays.iter().any(|display| {
-        display.id.adapter_luid == output.display_id.adapter_luid
-            && display.id.target_id == output.display_id.target_id
-    })
-}
-
 fn describe_output_for_error(
     output: &monarch::OutputConfig,
     base_snapshot: &TopologySnapshot,
@@ -824,18 +868,116 @@ fn describe_output_for_error(
     )
 }
 
+const RECOVER_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(3500);
+const RECOVER_SETTLE_STEP: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Fill in geometry for enabled outputs that still carry the 0x0 sentinel (a display seeded from
+/// ALL_PATHS and never active on this boot) using the post-extend snapshot, where Windows has
+/// just assigned it a real source mode.
+fn fill_sentinel_geometry_from_snapshot(layout: &mut Layout, snapshot: &TopologySnapshot) {
+    for output in &mut layout.outputs {
+        if !output.enabled || output.resolution.width != 0 || output.resolution.height != 0 {
+            continue;
+        }
+        let Some(active) = snapshot
+            .layout
+            .outputs
+            .iter()
+            .find(|active| active.display_id == output.display_id)
+        else {
+            continue;
+        };
+        output.position = active.position.clone();
+        output.resolution = active.resolution.clone();
+        output.refresh_rate_mhz = active.refresh_rate_mhz;
+    }
+}
+
+/// Best-effort undo of a `force_topology_extend` whose recovery did not pan out. The extend
+/// attaches every connected-inactive display AND saves it to the database, so leaving it in
+/// place would silently rewrite the user's topology on a failed attach. Re-applying the
+/// pre-extend layout works because its enabled set only covers the previously active outputs,
+/// and apply's `unwrap_or(false)` disables everything the extend added.
+fn restore_pre_extend_topology(pre_extend: &TopologySnapshot) {
+    match apply_layout_against_snapshot(&pre_extend.layout, pre_extend) {
+        Ok(_) => diagnostics::log("recover:restore_ok"),
+        Err(error) => diagnostics::log(format!("recover:restore_failed:{error}")),
+    }
+}
+
 fn recover_apply_with_topology_extend(
     working_layout: &Layout,
 ) -> Result<(TopologySnapshot, Layout), ManagerError> {
-    force_topology_extend()?;
-    std::thread::sleep(std::time::Duration::from_millis(700));
-    let recovered_snapshot = query_active_topology()?;
-    let retry_layout = remap_layout_display_ids_for_snapshot(
-        working_layout,
-        &recovered_snapshot.layout,
-        &raw_path_connectors(&recovered_snapshot.raw),
-    );
-    let snapshot = apply_layout_against_snapshot(&retry_layout, &recovered_snapshot)?;
+    // Capture the pre-extend topology so a failed recovery can be rolled back. Only its layout
+    // is reused; its raw paths are never fed back into SetDisplayConfig ahead of the extend.
+    let pre_extend = query_active_only_topology().ok();
+    if let Err(error) = force_topology_extend() {
+        // A killed-on-timeout DisplaySwitch may still have extended something: undo it.
+        if let Some(pre_extend) = &pre_extend {
+            restore_pre_extend_topology(pre_extend);
+        }
+        return Err(error);
+    }
+
+    // Poll instead of a single fixed sleep: an HDMI/TV handshake after an extend can take longer
+    // than a fixed settle, and the connector may come back under a different (adapter_luid,
+    // target_id), so the remap has to be redone on every attempt.
+    let deadline = std::time::Instant::now() + RECOVER_SETTLE_DEADLINE;
+    let mut attempt = 0usize;
+    let (recovered_snapshot, retry_layout) = loop {
+        attempt += 1;
+        std::thread::sleep(RECOVER_SETTLE_STEP);
+        let snapshot = match query_active_topology() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                // Never leave the extend applied on the way out.
+                if let Some(pre_extend) = &pre_extend {
+                    restore_pre_extend_topology(pre_extend);
+                }
+                return Err(error);
+            }
+        };
+        let layout = remap_layout_display_ids_for_snapshot(
+            working_layout,
+            &snapshot.layout,
+            &raw_path_connectors(&snapshot.raw),
+        );
+        let missing = enabled_outputs_missing_from_raw(&layout, &snapshot.raw);
+        diagnostics::log(format!(
+            "recover:settle_poll:{attempt}:missing={}",
+            missing.len()
+        ));
+        if missing.is_empty() {
+            break (snapshot, layout);
+        }
+        if std::time::Instant::now() >= deadline {
+            let description = describe_output_for_error(missing[0], &snapshot);
+            diagnostics::log(format!("recover:still_missing:{description}"));
+            if let Some(pre_extend) = &pre_extend {
+                restore_pre_extend_topology(pre_extend);
+            }
+            return Err(ManagerError::Backend(format!(
+                "cannot attach display {description}: it did not come back even after forcing a topology extend. reconnect it or attach it once from Windows Display settings"
+            )));
+        }
+    };
+
+    diagnostics::log("recover:resolved");
+    let mut retry_layout = retry_layout;
+    fill_sentinel_geometry_from_snapshot(&mut retry_layout, &recovered_snapshot);
+    let snapshot = match apply_layout_against_snapshot(&retry_layout, &recovered_snapshot) {
+        Ok(snapshot) => {
+            diagnostics::log("recover:retry_result:ok");
+            snapshot
+        }
+        Err(error) => {
+            diagnostics::log(format!("recover:retry_result:{error}"));
+            if let Some(pre_extend) = &pre_extend {
+                restore_pre_extend_topology(pre_extend);
+            }
+            return Err(error);
+        }
+    };
     Ok((snapshot, retry_layout))
 }
 

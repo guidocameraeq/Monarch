@@ -83,6 +83,7 @@ pub fn apply_layout_against_snapshot(
             exact_flags,
         );
         if status != 0 {
+            diagnostics::log(format!("apply:sdc_failed:{status}:exact_flags"));
             status = SetDisplayConfig(
                 Some(next_paths.as_slice()),
                 Some(next_modes.as_slice()),
@@ -94,6 +95,7 @@ pub fn apply_layout_against_snapshot(
         }
 
         if status != 0 {
+            diagnostics::log(format!("apply:sdc_failed:{status}:allow_changes"));
             return Err(ManagerError::Backend(format!(
                 "SetDisplayConfig failed: {}",
                 status
@@ -120,6 +122,9 @@ pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
     if set_display_status == 0 {
         return Ok(());
     }
+    diagnostics::log(format!(
+        "apply:sdc_failed:{set_display_status}:topology_extend"
+    ));
 
     // Some driver stacks reject direct topology-extend through SetDisplayConfig during
     // early-login / post-reboot states. Win+P still succeeds there, so fall back to the same
@@ -482,6 +487,12 @@ fn apply_desired_source_mode(
     let Some(output) = desired_output.copied() else {
         return;
     };
+    if output.resolution.width == 0 || output.resolution.height == 0 {
+        // Geometry sentinel (a seeded, never-yet-active display): writing 0x0 into the source
+        // mode would make SetDisplayConfig fail with 87 or stack the display on the primary.
+        // Leave the snapshot's real source mode untouched and let Windows place it.
+        return;
+    }
 
     let mode_index = unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize;
     let Some(mode) = modes.get_mut(mode_index) else {

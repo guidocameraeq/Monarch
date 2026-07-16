@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::hash::Hasher;
 use std::mem::size_of;
+use std::sync::{Mutex, OnceLock};
 
+use crate::diagnostics;
 use monarch::{DisplayInfo, Layout, ManagerError, OutputConfig, Position, Resolution};
 use windows::Win32::Devices::Display::{
     DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes, QueryDisplayConfig,
@@ -11,8 +13,8 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE,
     DISPLAYCONFIG_MODE_INFO_TYPE_TARGET, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_ROTATION,
     DISPLAYCONFIG_ROTATION_ROTATE270, DISPLAYCONFIG_ROTATION_ROTATE90,
-    DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_TOPOLOGY_ID, QDC_DATABASE_CURRENT,
-    QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS,
+    DISPLAYCONFIG_TARGET_DEVICE_NAME, DISPLAYCONFIG_TOPOLOGY_ID, QDC_ALL_PATHS,
+    QDC_DATABASE_CURRENT, QDC_ONLY_ACTIVE_PATHS, QUERY_DISPLAY_CONFIG_FLAGS,
 };
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 
@@ -20,14 +22,154 @@ use super::win32_types::{luid_to_u64, make_display_id, RawTopologySnapshot, Topo
 
 const DISPLAYCONFIG_PATH_ACTIVE_FLAG: u32 = 0x0000_0001;
 
+/// Per-enumeration observability counters. Logged (prefix "enum:") only when the resulting
+/// summary changes, because the watchdogs enumerate every 1.2s/1.8s.
+#[derive(Default)]
+struct EnumerationStats {
+    active_paths: usize,
+    db_paths: usize,
+    enriched: Vec<String>,
+    seeded: Vec<String>,
+    discarded: Vec<String>,
+}
+
 pub fn query_active_topology() -> Result<TopologySnapshot, ManagerError> {
+    let mut stats = EnumerationStats::default();
     let (active_paths, active_modes) = query_raw_active()?;
-    let (paths, modes) = enrich_with_missing_target_paths(
-        active_paths,
-        active_modes,
-        query_raw_database_current().ok(),
+    stats.active_paths = active_paths.len();
+    let db_raw = query_raw_database_current().ok();
+    stats.db_paths = db_raw.as_ref().map(|(paths, _)| paths.len()).unwrap_or(0);
+    let (paths, modes) =
+        enrich_with_missing_target_paths(active_paths, active_modes, db_raw, &mut stats);
+    let mut snapshot = snapshot_from_raw(RawTopologySnapshot { paths, modes })?;
+    seed_connected_inactive_displays(&mut snapshot, &mut stats);
+    log_enumeration_if_changed(&stats);
+    Ok(snapshot)
+}
+
+fn log_enumeration_if_changed(stats: &EnumerationStats) {
+    let line = format!(
+        "enum:active={}:db={}:enriched=[{}]:seeded=[{}]:discarded=[{}]",
+        stats.active_paths,
+        stats.db_paths,
+        stats.enriched.join(", "),
+        stats.seeded.join(", "),
+        stats.discarded.join(", ")
     );
-    snapshot_from_raw(RawTopologySnapshot { paths, modes })
+
+    static LAST: OnceLock<Mutex<String>> = OnceLock::new();
+    let last = LAST.get_or_init(|| Mutex::new(String::new()));
+    let Ok(mut last) = last.lock() else {
+        return;
+    };
+    if *last != line {
+        *last = line.clone();
+        diagnostics::log(line);
+    }
+}
+
+/// Make connected-but-inactive displays visible even when QDC_DATABASE_CURRENT enrichment did
+/// not surface their paths (seen in the field: a detached TV visible in Windows Display settings
+/// but absent from the database query). QDC_ALL_PATHS lists every source combination for every
+/// connected target; each yet-unrepresented connected target is added as display info ONLY —
+/// its raw paths/modes are deliberately NOT added to `snapshot.raw`, so nothing database-sourced
+/// ever reaches SetDisplayConfig. Attaching such a display goes through the extend recovery.
+fn seed_connected_inactive_displays(snapshot: &mut TopologySnapshot, stats: &mut EnumerationStats) {
+    let Ok((all_paths, all_modes)) = query_raw_with_flags(QDC_ALL_PATHS, false) else {
+        return;
+    };
+    let mode_map = modes_by_key(&all_modes);
+
+    let mut known_connectors = snapshot
+        .displays
+        .iter()
+        .map(|display| (display.id.adapter_luid, display.id.target_id))
+        .collect::<std::collections::HashSet<_>>();
+    let mut known_edids = snapshot
+        .displays
+        .iter()
+        .filter_map(|display| display.id.edid_hash)
+        .collect::<std::collections::HashSet<_>>();
+
+    for path in &all_paths {
+        let adapter_luid = luid_to_u64(
+            path.targetInfo.adapterId.HighPart,
+            path.targetInfo.adapterId.LowPart,
+        );
+        let connector = (adapter_luid, path.targetInfo.id);
+        if known_connectors.contains(&connector) {
+            // ALL_PATHS yields one entry per source combination; connectors already represented
+            // (active, enriched or seeded by an earlier combination) are the normal case.
+            continue;
+        }
+        // Every branch below decides this connector once; never revisit later combinations.
+        known_connectors.insert(connector);
+
+        if !path.targetInfo.targetAvailable.as_bool() {
+            stats
+                .discarded
+                .push(format!("target={}:unavailable", path.targetInfo.id));
+            continue;
+        }
+        let Ok((friendly_name, edid_hash)) = target_name_and_stable_hash(path) else {
+            stats
+                .discarded
+                .push(format!("target={}:name-fail", path.targetInfo.id));
+            continue;
+        };
+        if let Some(hash) = edid_hash {
+            if known_edids.contains(&hash) {
+                stats
+                    .discarded
+                    .push(format!("target={}:dedupe", path.targetInfo.id));
+                continue;
+            }
+            known_edids.insert(hash);
+        }
+
+        // Best-effort refresh rate: the target mode key is specific to this target, so a hit
+        // genuinely belongs to this display.
+        let target_key = (
+            path.targetInfo.adapterId.HighPart,
+            path.targetInfo.adapterId.LowPart,
+            path.targetInfo.id,
+            DISPLAYCONFIG_MODE_INFO_TYPE_TARGET.0 as u32,
+        );
+        let refresh_rate_mhz = mode_map
+            .get(&target_key)
+            .and_then(|mode| target_mode_refresh_mhz(mode).ok())
+            .unwrap_or(60_000);
+        // Resolution/position are deliberately a 0x0 sentinel: QDC_ALL_PATHS only carries modes
+        // for ACTIVE paths, so a source-mode lookup here would alias another display's geometry
+        // (the source id of an inactive path points at a source that belongs to whoever is
+        // currently driving it). Downstream, the cache merge restores the last real geometry and
+        // the attach recovery fills it from the post-extend snapshot.
+        let resolution = Resolution {
+            width: 0,
+            height: 0,
+        };
+
+        let display_id = make_display_id(adapter_luid, path.targetInfo.id, edid_hash);
+        stats
+            .seeded
+            .push(format!("'{friendly_name}':{}", path.targetInfo.id));
+        snapshot.layout.outputs.push(OutputConfig {
+            display_id: display_id.clone(),
+            enabled: false,
+            position: Position { x: 0, y: 0 },
+            resolution: resolution.clone(),
+            refresh_rate_mhz,
+            primary: false,
+        });
+        snapshot.displays.push(DisplayInfo {
+            id: display_id,
+            friendly_name,
+            is_active: false,
+            is_primary: false,
+            resolution,
+            refresh_rate_mhz,
+        });
+    }
 }
 
 /// Active-only snapshot without QDC_DATABASE_CURRENT enrichment. Used as the base for
@@ -137,6 +279,7 @@ fn enrich_with_missing_target_paths(
     mut base_paths: Vec<DISPLAYCONFIG_PATH_INFO>,
     mut base_modes: Vec<DISPLAYCONFIG_MODE_INFO>,
     candidate_raw: Option<(Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>)>,
+    stats: &mut EnumerationStats,
 ) -> (Vec<DISPLAYCONFIG_PATH_INFO>, Vec<DISPLAYCONFIG_MODE_INFO>) {
     let Some((candidate_paths, candidate_modes)) = candidate_raw else {
         return (base_paths, base_modes);
@@ -155,14 +298,24 @@ fn enrich_with_missing_target_paths(
     for candidate in candidate_paths {
         let target_identity = path_target_identity(&candidate);
         if known_targets.contains(&target_identity) {
+            // Normal case: every active target also shows up in the database query.
             continue;
         }
-        if target_name_and_stable_hash(&candidate).is_err() {
+        let Ok((candidate_name, _)) = target_name_and_stable_hash(&candidate) else {
+            stats
+                .discarded
+                .push(format!("target={}:name-fail", candidate.targetInfo.id));
             continue;
-        }
+        };
         if !candidate_path_is_attachable(&candidate, &candidate_modes) {
+            stats
+                .discarded
+                .push(format!("target={}:not-attachable", candidate.targetInfo.id));
             continue;
         }
+        stats
+            .enriched
+            .push(format!("'{candidate_name}':{}", candidate.targetInfo.id));
 
         let mut next_path = candidate;
         unsafe {

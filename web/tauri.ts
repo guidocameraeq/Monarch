@@ -35,8 +35,11 @@ const mockListeners = new Map<string, Set<MockListener>>();
 const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
 const useWebMock =
   (viteEnv?.VITE_MONARCH_WEB_MOCK ?? "") === "1" || !isTauriRuntime();
-const GITHUB_RELEASES_LATEST_API = "https://api.github.com/repos/Nuzair46/Monarch/releases/latest";
-const GITHUB_RELEASES_URL = "https://github.com/Nuzair46/Monarch/releases";
+// Fork release tags MUST be >= v1.51.0: this build is 1.51.x, and the numeric comparison below
+// would report "up to date" against any lower tag (e.g. an upstream-style v1.6.x).
+const GITHUB_RELEASES_LATEST_API =
+  "https://api.github.com/repos/guidocameraeq/Monarch/releases/latest";
+const GITHUB_RELEASES_URL = "https://github.com/guidocameraeq/Monarch/releases";
 
 let mockState = buildMockSnapshot();
 let mockRestorableLayout = cloneLayout(mockState.layout);
@@ -363,6 +366,18 @@ export async function checkGithubReleaseUpdate(): Promise<ReleaseUpdateCheckResu
       Accept: "application/vnd.github+json",
     },
   });
+
+  if (response.status === 404) {
+    // The personal fork has no releases (yet): "no releases" means there is nothing newer
+    // than the running build, so report up-to-date instead of surfacing an error toast.
+    return {
+      currentVersion,
+      latestVersion: currentVersion,
+      latestTag: `v${currentVersion}`,
+      updateAvailable: false,
+      releaseUrl: GITHUB_RELEASES_URL,
+    };
+  }
 
   if (!response.ok) {
     throw new Error(`GitHub releases check failed (${response.status})`);
