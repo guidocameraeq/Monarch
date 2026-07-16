@@ -11,14 +11,16 @@ use monarch::{DisplayBackend, DisplayId, DisplayInfo, Layout, ManagerError};
 use serde::{Deserialize, Serialize};
 
 use super::apply::{
-    active_color_state_signature, apply_layout_against_snapshot, capture_sdr_gamma_ramps,
-    force_topology_extend, gamma_ramp_looks_identity,
-    reapply_color_calibration_for_active_with_cached_sdr, GammaRampKey, GammaRampWords,
+    active_color_state_signature, apply_attach_paths, apply_layout_against_snapshot,
+    build_attach_paths, capture_sdr_gamma_ramps, gamma_ramp_looks_identity,
+    reapply_color_calibration_for_active_with_cached_sdr, run_display_switch_extend,
+    try_topology_extend, validate_attach_paths, GammaRampKey, GammaRampWords,
 };
 use super::enumerate::{query_active_only_topology, query_active_topology, snapshot_from_raw};
-use super::win32_types::{luid_to_u64, RawTopologySnapshot, TopologySnapshot};
+use super::win32_types::{luid_to_u64, AttachablePath, RawTopologySnapshot, TopologySnapshot};
 
 const PERSISTED_RAW_SNAPSHOT_VERSION: u32 = 1;
+const DISPLAYCONFIG_PATH_ACTIVE_FLAG: u32 = 0x0000_0001;
 
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedRawSnapshot {
@@ -57,14 +59,28 @@ impl WindowsDisplayBackend {
                     match merge_persisted_raw_for_fresh(&fresh, &persisted_raw) {
                         Some(merged) => merged,
                         None => {
-                            // The persisted snapshot no longer matches this boot (e.g. adapter
-                            // LUID churn after a reboot). Keep the file on disk: overwriting it
-                            // here would destroy the only record of a detached display's path.
-                            // It is replaced after the next successful apply.
-                            persist_now = false;
-                            diagnostics::log(
-                                "topology_persist:skip:persisted_snapshot_rejected_at_startup",
-                            );
+                            // Two very different causes land here, and only one justifies a
+                            // rewrite:
+                            //  (a) no connector in common -> adapter LUID churn across a reboot.
+                            //      The file describes a boot that no longer exists and never will
+                            //      again: a fossil. Overwrite it, or it blocks forever — the only
+                            //      other writer is a successful apply, which a stale snapshot can
+                            //      itself block.
+                            //  (b) connectors still overlap -> the LUIDs are current and the
+                            //      active set simply changed (e.g. the user attached something
+                            //      from Windows Display settings). The persisted paths of the
+                            //      OTHER connectors are still real and may be the last record of
+                            //      a detached display, so keep them: a kept fossil is inert (this
+                            //      session uses `fresh` and the merge re-rejects it), a destroyed
+                            //      one never comes back.
+                            let persisted_connectors = raw_path_connectors(&persisted_raw);
+                            let fresh_connectors = raw_path_connectors(&fresh.raw);
+                            persist_now = persisted_connectors.is_disjoint(&fresh_connectors);
+                            diagnostics::log(if persist_now {
+                                "topology_persist:replace:persisted_snapshot_from_another_boot"
+                            } else {
+                                "topology_persist:keep:persisted_snapshot_rejected_but_current"
+                            });
                             fresh
                         }
                     }
@@ -117,18 +133,19 @@ impl WindowsDisplayBackend {
             return Ok(());
         }
 
-        // Capture the pre-extend topology so a fruitless extend can be undone: it attaches every
-        // connected-inactive display with SDC_SAVE_TO_DATABASE, which would silently become the
-        // user's persisted topology if we bailed out without restoring.
-        let pre_extend = query_active_only_topology().ok();
-        diagnostics::log("prepare_attach_targets:force_extend");
-        if let Err(error) = force_topology_extend() {
-            diagnostics::log(format!("prepare_attach_targets:extend_failed:{error}"));
+        // The extend attaches every connected-inactive display and persists that, so a rollback
+        // net is a hard precondition here too: without one, do not touch the topology at all and
+        // let the caller's strict re-validation report the real error.
+        let Ok(pre_extend) = capture_pre_recovery_state() else {
+            diagnostics::log("prepare_attach_targets:abort:no_pre_state_captured");
             return Ok(());
-        }
+        };
+        diagnostics::log("prepare_attach_targets:force_extend");
+        try_topology_extend();
 
         // Poll rather than sleep once: a TV/HDMI handshake after an extend can outlast a fixed
-        // settle, and the display may return under a different (adapter_luid, target_id).
+        // settle, and the display may return under a different (adapter_luid, target_id). The
+        // extend's own status cannot judge success (0 is also a no-op), so observation decides.
         let deadline = std::time::Instant::now() + RECOVER_SETTLE_DEADLINE;
         let mut attempt = 0usize;
         loop {
@@ -138,9 +155,7 @@ impl WindowsDisplayBackend {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     // Never leave the extend applied on the way out.
-                    if let Some(pre_extend) = &pre_extend {
-                        restore_pre_extend_topology(pre_extend);
-                    }
+                    restore_pre_extend_topology(&pre_extend);
                     let _ = self.invalidate_cache();
                     return Err(error);
                 }
@@ -155,9 +170,7 @@ impl WindowsDisplayBackend {
             if std::time::Instant::now() >= deadline {
                 // The extend did not expose the display: undo its collateral and let the
                 // caller's strict re-validation report the real, actionable error.
-                if let Some(pre_extend) = &pre_extend {
-                    restore_pre_extend_topology(pre_extend);
-                }
+                restore_pre_extend_topology(&pre_extend);
                 return self.invalidate_cache();
             }
         }
@@ -273,6 +286,8 @@ fn merge_persisted_raw_for_fresh(
             &fresh.displays,
             &fresh_connectors,
         ),
+        // Attach candidates come from the live ALL_PATHS enumeration, never from persisted data.
+        attachable: fresh.attachable.clone(),
     })
 }
 
@@ -578,11 +593,10 @@ impl DisplayBackend for WindowsDisplayBackend {
             enabled_outputs_missing_from_raw(&working_layout, &base_snapshot.raw);
         let (next_snapshot, applied_layout) = if !missing_attach_outputs.is_empty() {
             // The base snapshot has no path for these outputs, so flipping active flags would be
-            // a silent no-op (SetDisplayConfig returns 0 on an unchanged active set). Force a
-            // topology extend UNCONDITIONALLY and retry once: a "is it connected?" guard here
-            // would rely on the same enumeration that just failed to surface the display,
-            // blocking exactly the case it must cure (detached display missing from the database
-            // query). The cost for a genuinely absent monitor is one harmless extend attempt
+            // a silent no-op (SetDisplayConfig returns 0 on an unchanged active set). Recover
+            // UNCONDITIONALLY: an "is it connected?" guard here would rely on the same
+            // enumeration that just failed to surface the display, blocking exactly the case it
+            // must cure. The cost for a genuinely absent monitor is one harmless attempt
             // followed by the same precise error from the retry validation.
             for output in &missing_attach_outputs {
                 diagnostics::log(format!(
@@ -590,13 +604,17 @@ impl DisplayBackend for WindowsDisplayBackend {
                     describe_output_for_error(output, &base_snapshot)
                 ));
             }
-            recover_apply_with_topology_extend(&working_layout)?
+            recover_apply_with_topology_extend(
+                &working_layout,
+                &missing_attach_outputs,
+                &active_snapshot,
+            )?
         } else {
             match apply_layout_against_snapshot(&working_layout, &base_snapshot) {
                 Ok(snapshot) => (snapshot, working_layout),
                 Err(error) if is_set_display_invalid_parameter(&error) => {
                     diagnostics::log("topology_apply:retry:reason=setdisplayconfig_87");
-                    recover_apply_with_topology_extend(&working_layout)?
+                    recover_apply_with_topology_extend(&working_layout, &[], &active_snapshot)?
                 }
                 Err(error) => {
                     diagnostics::log(format!("topology_apply:error:{error}"));
@@ -870,6 +888,10 @@ fn describe_output_for_error(
 
 const RECOVER_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(3500);
 const RECOVER_SETTLE_STEP: std::time::Duration = std::time::Duration::from_millis(250);
+/// Grace window after an explicit attach Windows already accepted: it only has to cover the
+/// display's handshake, so it is much shorter than the deadline for an extend that may have to
+/// wake a target from scratch.
+const ATTACH_SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1500);
 
 /// Fill in geometry for enabled outputs that still carry the 0x0 sentinel (a display seeded from
 /// ALL_PATHS and never active on this boot) using the post-extend snapshot, where Windows has
@@ -893,11 +915,131 @@ fn fill_sentinel_geometry_from_snapshot(layout: &mut Layout, snapshot: &Topology
     }
 }
 
-/// Best-effort undo of a `force_topology_extend` whose recovery did not pan out. The extend
-/// attaches every connected-inactive display AND saves it to the database, so leaving it in
-/// place would silently rewrite the user's topology on a failed attach. Re-applying the
-/// pre-extend layout works because its enabled set only covers the previously active outputs,
-/// and apply's `unwrap_or(false)` disables everything the extend added.
+/// Source keys `(source adapter luid, source id)` currently driving an active path. Attaching a
+/// target onto a busy source would clone that display instead of extending onto it.
+fn active_source_keys(snapshot: &TopologySnapshot) -> HashSet<(u64, u32)> {
+    snapshot
+        .raw
+        .paths
+        .iter()
+        .filter(|path| path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .map(|path| {
+            (
+                luid_to_u64(
+                    path.sourceInfo.adapterId.HighPart,
+                    path.sourceInfo.adapterId.LowPart,
+                ),
+                path.sourceInfo.id,
+            )
+        })
+        .collect()
+}
+
+fn attachable_source_key(candidate: &AttachablePath) -> (u64, u32) {
+    (
+        luid_to_u64(
+            candidate.path.sourceInfo.adapterId.HighPart,
+            candidate.path.sourceInfo.adapterId.LowPart,
+        ),
+        candidate.path.sourceInfo.id,
+    )
+}
+
+/// Attach candidates for `display_id` whose source is currently free. ALL_PATHS reports one
+/// entry per (source, target) combination; picking a busy source would clone rather than extend,
+/// so those combinations are dropped rather than rewritten.
+fn select_attach_candidates<'a>(
+    attachable: &'a [AttachablePath],
+    display_id: &DisplayId,
+    used_source_keys: &HashSet<(u64, u32)>,
+) -> Vec<&'a AttachablePath> {
+    attachable
+        .iter()
+        .filter(|candidate| {
+            candidate.adapter_luid == display_id.adapter_luid
+                && candidate.target_id == display_id.target_id
+        })
+        .filter(|candidate| !used_source_keys.contains(&attachable_source_key(candidate)))
+        .collect()
+}
+
+/// Activate every still-missing enabled output in ONE SetDisplayConfig call.
+///
+/// The supplied path array is the complete topology, so a per-display call would deactivate
+/// whatever the previous call activated. Instead the batch grows one candidate at a time, each
+/// step confirmed with a free SDC_VALIDATE dry-run (alternate sources are tried when a candidate
+/// is refused), and a single apply lands at the end — one topology flip, not N.
+///
+/// Returns true only when the final apply returned 0. That still does NOT prove any display came
+/// back (SetDisplayConfig returns 0 for a no-op), so the caller must confirm against a fresh
+/// enumeration before deciding to skip the extend.
+fn try_batch_explicit_attach(
+    missing: &[&monarch::OutputConfig],
+    active_snapshot: &TopologySnapshot,
+) -> bool {
+    // Guard: the error-87 recovery path calls in with nothing missing. Without this, an empty
+    // batch would report "everything attached" and silently kill the extend fallback.
+    if missing.is_empty() {
+        return false;
+    }
+
+    let mut used_source_keys = active_source_keys(active_snapshot);
+    let mut batch: Vec<&AttachablePath> = Vec::new();
+
+    for output in missing {
+        let description = describe_output_for_error(output, active_snapshot);
+        let candidates = select_attach_candidates(
+            &active_snapshot.attachable,
+            &output.display_id,
+            &used_source_keys,
+        );
+        if candidates.is_empty() {
+            diagnostics::log(format!("recover:no_attachable_candidate:{description}"));
+            continue;
+        }
+
+        let mut accepted = false;
+        for candidate in candidates {
+            batch.push(candidate);
+            let paths = build_attach_paths(&batch, active_snapshot);
+            let status = validate_attach_paths(&paths, active_snapshot);
+            diagnostics::log(format!(
+                "recover:explicit_attach:{description}:source={}:validate={status}",
+                attachable_source_key(candidate).1
+            ));
+            if status == 0 {
+                // Claim the source so a later output in this batch cannot reuse it.
+                used_source_keys.insert(attachable_source_key(candidate));
+                accepted = true;
+                break;
+            }
+            batch.pop();
+        }
+        if !accepted {
+            diagnostics::log(format!(
+                "recover:explicit_attach:{description}:no_candidate_validated"
+            ));
+        }
+    }
+
+    if batch.is_empty() {
+        return false;
+    }
+
+    let paths = build_attach_paths(&batch, active_snapshot);
+    let status = apply_attach_paths(&paths, active_snapshot);
+    diagnostics::log(format!(
+        "recover:explicit_attach:batch={}:apply={status}",
+        batch.len()
+    ));
+    status == 0
+}
+
+/// Best-effort undo of a recovery that did not pan out. Both the explicit attach and the extend
+/// change (and persist) the topology, so leaving them in place would silently rewrite the user's
+/// setup on a failed attach. Re-applying the pre-recovery layout works because its enabled set
+/// only covers the previously active outputs, and apply's `unwrap_or(false)` disables everything
+/// the recovery added.
 fn restore_pre_extend_topology(pre_extend: &TopologySnapshot) {
     match apply_layout_against_snapshot(&pre_extend.layout, pre_extend) {
         Ok(_) => diagnostics::log("recover:restore_ok"),
@@ -905,38 +1047,45 @@ fn restore_pre_extend_topology(pre_extend: &TopologySnapshot) {
     }
 }
 
-fn recover_apply_with_topology_extend(
-    working_layout: &Layout,
-) -> Result<(TopologySnapshot, Layout), ManagerError> {
-    // Capture the pre-extend topology so a failed recovery can be rolled back. Only its layout
-    // is reused; its raw paths are never fed back into SetDisplayConfig ahead of the extend.
-    let pre_extend = query_active_only_topology().ok();
-    if let Err(error) = force_topology_extend() {
-        // A killed-on-timeout DisplaySwitch may still have extended something: undo it.
-        if let Some(pre_extend) = &pre_extend {
-            restore_pre_extend_topology(pre_extend);
+/// The pre-recovery topology is the ONLY rollback net on a machine with no internal panel, so it
+/// is a hard precondition rather than an optional extra: capture it (with one retry, because it
+/// fails exactly when a transient QueryDisplayConfig hiccup is most likely) or do not touch the
+/// topology at all.
+fn capture_pre_recovery_state() -> Result<TopologySnapshot, ManagerError> {
+    match query_active_only_topology() {
+        Ok(snapshot) => Ok(snapshot),
+        Err(first_error) => {
+            diagnostics::log(format!(
+                "recover:pre_state_query_failed:{first_error}:retrying"
+            ));
+            std::thread::sleep(RECOVER_SETTLE_STEP);
+            query_active_only_topology()
         }
-        return Err(error);
     }
+}
 
-    // Poll instead of a single fixed sleep: an HDMI/TV handshake after an extend can take longer
-    // than a fixed settle, and the connector may come back under a different (adapter_luid,
-    // target_id), so the remap has to be redone on every attempt.
-    let deadline = std::time::Instant::now() + RECOVER_SETTLE_DEADLINE;
+enum SettleOutcome {
+    Settled(TopologySnapshot, Layout),
+    StillMissing(String),
+}
+
+/// Poll a fresh enumeration until every enabled output of `working_layout` resolves, or the
+/// deadline passes. Polling (rather than one fixed sleep) is what an HDMI/TV handshake needs,
+/// and the remap is redone on every attempt because the connector can come back under a
+/// different (adapter_luid, target_id).
+///
+/// Reports what it observed and nothing more: rollback and error wording are the caller's call.
+fn settle_poll(
+    working_layout: &Layout,
+    deadline: std::time::Duration,
+    label: &str,
+) -> Result<SettleOutcome, ManagerError> {
+    let deadline_at = std::time::Instant::now() + deadline;
     let mut attempt = 0usize;
-    let (recovered_snapshot, retry_layout) = loop {
+    loop {
         attempt += 1;
         std::thread::sleep(RECOVER_SETTLE_STEP);
-        let snapshot = match query_active_topology() {
-            Ok(snapshot) => snapshot,
-            Err(error) => {
-                // Never leave the extend applied on the way out.
-                if let Some(pre_extend) = &pre_extend {
-                    restore_pre_extend_topology(pre_extend);
-                }
-                return Err(error);
-            }
-        };
+        let snapshot = query_active_topology()?;
         let layout = remap_layout_display_ids_for_snapshot(
             working_layout,
             &snapshot.layout,
@@ -944,41 +1093,126 @@ fn recover_apply_with_topology_extend(
         );
         let missing = enabled_outputs_missing_from_raw(&layout, &snapshot.raw);
         diagnostics::log(format!(
-            "recover:settle_poll:{attempt}:missing={}",
+            "recover:settle_poll:{label}:{attempt}:missing={}",
             missing.len()
         ));
         if missing.is_empty() {
-            break (snapshot, layout);
+            return Ok(SettleOutcome::Settled(snapshot, layout));
         }
-        if std::time::Instant::now() >= deadline {
-            let description = describe_output_for_error(missing[0], &snapshot);
-            diagnostics::log(format!("recover:still_missing:{description}"));
-            if let Some(pre_extend) = &pre_extend {
-                restore_pre_extend_topology(pre_extend);
-            }
-            return Err(ManagerError::Backend(format!(
-                "cannot attach display {description}: it did not come back even after forcing a topology extend. reconnect it or attach it once from Windows Display settings"
+        if std::time::Instant::now() >= deadline_at {
+            return Ok(SettleOutcome::StillMissing(describe_output_for_error(
+                missing[0], &snapshot,
             )));
         }
-    };
+    }
+}
 
-    diagnostics::log("recover:resolved");
+/// Apply the desired layout once the recovery has brought every output back.
+fn finish_recovery(
+    recovered_snapshot: TopologySnapshot,
+    retry_layout: Layout,
+    pre_state: &TopologySnapshot,
+) -> Result<(TopologySnapshot, Layout), ManagerError> {
     let mut retry_layout = retry_layout;
     fill_sentinel_geometry_from_snapshot(&mut retry_layout, &recovered_snapshot);
-    let snapshot = match apply_layout_against_snapshot(&retry_layout, &recovered_snapshot) {
+    match apply_layout_against_snapshot(&retry_layout, &recovered_snapshot) {
         Ok(snapshot) => {
             diagnostics::log("recover:retry_result:ok");
-            snapshot
+            Ok((snapshot, retry_layout))
         }
         Err(error) => {
             diagnostics::log(format!("recover:retry_result:{error}"));
-            if let Some(pre_extend) = &pre_extend {
-                restore_pre_extend_topology(pre_extend);
-            }
+            restore_pre_extend_topology(pre_state);
+            Err(error)
+        }
+    }
+}
+
+fn recover_apply_with_topology_extend(
+    working_layout: &Layout,
+    missing: &[&monarch::OutputConfig],
+    active_snapshot: &TopologySnapshot,
+) -> Result<(TopologySnapshot, Layout), ManagerError> {
+    // The rollback net is a hard precondition: never touch the topology without one.
+    let pre_state = match capture_pre_recovery_state() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            diagnostics::log("recover:abort:no_pre_state_captured");
             return Err(error);
         }
     };
-    Ok((snapshot, retry_layout))
+
+    // Every recovery step actually attempted, so the final error can name them honestly.
+    let mut attempted: Vec<&str> = Vec::new();
+
+    // (a) Explicit attach: activates these exact targets from their own enumerated paths, the
+    // way Windows Display settings does. SDC_TOPOLOGY_EXTEND cannot substitute for it — it
+    // replays the last extended configuration from the persistence database, and a Monarch
+    // detach (saved with SDC_SAVE_TO_DATABASE) already removed this display from that entry.
+    if try_batch_explicit_attach(missing, active_snapshot) {
+        attempted.push("an explicit attach");
+        // A 0 from SetDisplayConfig only means "accepted", never "the display is back": confirm
+        // against a fresh enumeration, and keep escalating if it did not actually return.
+        match settle_poll(working_layout, ATTACH_SETTLE_DEADLINE, "attach") {
+            Ok(SettleOutcome::Settled(snapshot, layout)) => {
+                diagnostics::log("recover:resolved:explicit_attach");
+                return finish_recovery(snapshot, layout, &pre_state);
+            }
+            Ok(SettleOutcome::StillMissing(_)) => {
+                diagnostics::log("recover:attach_not_observed:escalating");
+            }
+            Err(error) => {
+                restore_pre_extend_topology(&pre_state);
+                return Err(error);
+            }
+        }
+    }
+
+    // (b) CCD topology extend. Its status cannot judge success (0 is also returned for a no-op),
+    // so the settle poll decides.
+    attempted.push("a topology extend");
+    try_topology_extend();
+    let still_missing = match settle_poll(working_layout, RECOVER_SETTLE_DEADLINE, "extend") {
+        Ok(SettleOutcome::Settled(snapshot, layout)) => {
+            diagnostics::log("recover:resolved:topology_extend");
+            return finish_recovery(snapshot, layout, &pre_state);
+        }
+        Ok(SettleOutcome::StillMissing(description)) => description,
+        Err(error) => {
+            restore_pre_extend_topology(&pre_state);
+            return Err(error);
+        }
+    };
+
+    // (c) DisplaySwitch: same shell path as Win+P, last resort.
+    diagnostics::log(format!("recover:escalate:display_switch:{still_missing}"));
+    if let Err(error) = run_display_switch_extend() {
+        diagnostics::log(format!("recover:display_switch_failed:{error}"));
+        restore_pre_extend_topology(&pre_state);
+        return Err(error);
+    }
+    attempted.push("DisplaySwitch /extend");
+
+    let still_missing = match settle_poll(working_layout, RECOVER_SETTLE_DEADLINE, "display_switch")
+    {
+        Ok(SettleOutcome::Settled(snapshot, layout)) => {
+            diagnostics::log("recover:resolved:display_switch");
+            return finish_recovery(snapshot, layout, &pre_state);
+        }
+        Ok(SettleOutcome::StillMissing(description)) => description,
+        Err(error) => {
+            restore_pre_extend_topology(&pre_state);
+            return Err(error);
+        }
+    };
+
+    // (d) Out of options: undo everything the recovery touched and name what was tried.
+    diagnostics::log(format!("recover:still_missing:{still_missing}"));
+    restore_pre_extend_topology(&pre_state);
+    Err(ManagerError::Backend(format!(
+        "cannot attach display {still_missing}: it did not come back after {}. reconnect it or attach it once from Windows Display settings",
+        attempted.join(", then ")
+    )))
 }
 
 fn unique_unused_candidates<'a>(

@@ -18,7 +18,9 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::ERROR_INSUFFICIENT_BUFFER;
 
-use super::win32_types::{luid_to_u64, make_display_id, RawTopologySnapshot, TopologySnapshot};
+use super::win32_types::{
+    luid_to_u64, make_display_id, AttachablePath, RawTopologySnapshot, TopologySnapshot,
+};
 
 const DISPLAYCONFIG_PATH_ACTIVE_FLAG: u32 = 0x0000_0001;
 
@@ -71,9 +73,10 @@ fn log_enumeration_if_changed(stats: &EnumerationStats) {
 /// Make connected-but-inactive displays visible even when QDC_DATABASE_CURRENT enrichment did
 /// not surface their paths (seen in the field: a detached TV visible in Windows Display settings
 /// but absent from the database query). QDC_ALL_PATHS lists every source combination for every
-/// connected target; each yet-unrepresented connected target is added as display info ONLY —
-/// its raw paths/modes are deliberately NOT added to `snapshot.raw`, so nothing database-sourced
-/// ever reaches SetDisplayConfig. Attaching such a display goes through the extend recovery.
+/// connected target; each yet-unrepresented connected target is added as display info, and its
+/// paths are kept in `snapshot.attachable` so the recovery can activate it explicitly.
+/// Those paths are deliberately NOT added to `snapshot.raw`, which is the current configuration
+/// and goes straight to SetDisplayConfig on every apply.
 fn seed_connected_inactive_displays(snapshot: &mut TopologySnapshot, stats: &mut EnumerationStats) {
     let Ok((all_paths, all_modes)) = query_raw_with_flags(QDC_ALL_PATHS, false) else {
         return;
@@ -90,6 +93,7 @@ fn seed_connected_inactive_displays(snapshot: &mut TopologySnapshot, stats: &mut
         .iter()
         .filter_map(|display| display.id.edid_hash)
         .collect::<std::collections::HashSet<_>>();
+    let mut seeded_connectors = std::collections::HashSet::new();
 
     for path in &all_paths {
         let adapter_luid = luid_to_u64(
@@ -153,6 +157,7 @@ fn seed_connected_inactive_displays(snapshot: &mut TopologySnapshot, stats: &mut
         stats
             .seeded
             .push(format!("'{friendly_name}':{}", path.targetInfo.id));
+        seeded_connectors.insert(connector);
         snapshot.layout.outputs.push(OutputConfig {
             display_id: display_id.clone(),
             enabled: false,
@@ -168,6 +173,24 @@ fn seed_connected_inactive_displays(snapshot: &mut TopologySnapshot, stats: &mut
             is_primary: false,
             resolution,
             refresh_rate_mhz,
+        });
+    }
+
+    // Keep every (source, target) combination for the seeded targets: the source is only picked
+    // at attach time, and it must be one that is currently free (a busy source would clone).
+    for path in &all_paths {
+        let adapter_luid = luid_to_u64(
+            path.targetInfo.adapterId.HighPart,
+            path.targetInfo.adapterId.LowPart,
+        );
+        let connector = (adapter_luid, path.targetInfo.id);
+        if !seeded_connectors.contains(&connector) {
+            continue;
+        }
+        snapshot.attachable.push(AttachablePath {
+            path: *path,
+            adapter_luid,
+            target_id: path.targetInfo.id,
         });
     }
 }
@@ -272,6 +295,7 @@ pub(super) fn snapshot_from_raw(
         raw,
         layout: Layout { outputs },
         displays,
+        attachable: Vec::new(),
     })
 }
 

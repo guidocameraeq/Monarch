@@ -19,7 +19,8 @@ use windows::Win32::Devices::Display::{
     DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO, DISPLAYCONFIG_MODE_INFO,
     DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME,
     DISPLAYCONFIG_TARGET_DEVICE_NAME, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_NO_OPTIMIZATION,
-    SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND, SDC_USE_SUPPLIED_DISPLAY_CONFIG,
+    SDC_PATH_PERSIST_IF_REQUIRED, SDC_SAVE_TO_DATABASE, SDC_TOPOLOGY_EXTEND,
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG, SDC_VALIDATE,
 };
 use windows::Win32::Graphics::Gdi::{CreateDCW, DeleteDC};
 use windows::Win32::System::Com::{
@@ -32,9 +33,11 @@ use windows::Win32::UI::ColorSystem::{
 };
 use windows::Win32::UI::Shell::{DesktopWallpaper, IDesktopWallpaper, DESKTOP_WALLPAPER_POSITION};
 
-use super::win32_types::{luid_to_u64, TopologySnapshot};
+use super::win32_types::{luid_to_u64, AttachablePath, TopologySnapshot};
 
 const DISPLAYCONFIG_PATH_ACTIVE_FLAG: u32 = 0x0000_0001;
+/// `DISPLAYCONFIG_PATH_MODE_IDX_INVALID`: "no mode supplied, let Windows pick one".
+const DISPLAYCONFIG_PATH_MODE_IDX_INVALID: u32 = 0xffff_ffff;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const GAMMA_RAMP_WORDS: usize = 3 * 256;
 pub(super) type GammaRampKey = (u64, u32);
@@ -111,32 +114,137 @@ pub fn apply_layout_against_snapshot(
     Ok(next_snapshot)
 }
 
-pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
-    let set_display_status = unsafe {
+/// Build the path array that activates `candidates` on top of the currently active paths: the
+/// active paths keep their mode indices (so the other displays hold their exact geometry) and
+/// each candidate is appended with the ACTIVE flag and no mode indices, letting Windows compute
+/// its mode. This is what Windows Display settings does, and it is the cure for the case
+/// SDC_TOPOLOGY_EXTEND cannot fix: the extend replays the last extended configuration from the
+/// persistence database, which a Monarch detach (saved with SDC_SAVE_TO_DATABASE) already
+/// stripped this display from.
+///
+/// The array is the COMPLETE topology (SDC_USE_SUPPLIED_DISPLAY_CONFIG): any path left out is
+/// deactivated. Every candidate must therefore go in one array — attaching them one call at a
+/// time would detach whatever the previous call attached.
+///
+/// What SDC_VALIDATE probes actually established (on a single-display machine):
+///   active paths + supplied mode array, one path with invalid mode indices -> accepted
+///   every path with invalid mode indices + NULL mode array                 -> 87, always
+/// so the mode-less shape is a parameter-level rejection and is not attempted. NOT VERIFIED:
+/// appending the path of a currently INACTIVE target — the exact operation below — because that
+/// machine has no connected-but-inactive target to try it on. The mandatory SDC_VALIDATE dry-run
+/// before every apply is what covers this gap at runtime.
+///
+/// Returns an empty vec when there are no active paths to build on.
+pub(super) fn build_attach_paths(
+    candidates: &[&AttachablePath],
+    active_snapshot: &TopologySnapshot,
+) -> Vec<DISPLAYCONFIG_PATH_INFO> {
+    let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> = active_snapshot
+        .raw
+        .paths
+        .iter()
+        .filter(|path| path.flags & DISPLAYCONFIG_PATH_ACTIVE_FLAG != 0)
+        .copied()
+        .collect();
+    if paths.is_empty() {
+        return Vec::new();
+    }
+
+    for candidate in candidates {
+        let mut next = candidate.path;
+        next.flags |= DISPLAYCONFIG_PATH_ACTIVE_FLAG;
+        unsafe {
+            next.sourceInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+            next.targetInfo.Anonymous.modeInfoIdx = DISPLAYCONFIG_PATH_MODE_IDX_INVALID;
+        }
+        paths.push(next);
+    }
+    paths
+}
+
+/// SDC_ALLOW_CHANGES is legal here (and needed so Windows may compute the new mode): it is only
+/// rejected alongside SDC_TOPOLOGY_*.
+fn attach_flags() -> windows::Win32::Devices::Display::SET_DISPLAY_CONFIG_FLAGS {
+    SDC_USE_SUPPLIED_DISPLAY_CONFIG | SDC_ALLOW_CHANGES
+}
+
+/// Dry-run: SDC_VALIDATE changes nothing, so it is free to call and mandatory before applying —
+/// this runs on desktops with no internal panel, where a bad apply leaves no rescue screen.
+/// Returns the raw SetDisplayConfig status (0 = the configuration is accepted).
+pub(super) fn validate_attach_paths(
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    active_snapshot: &TopologySnapshot,
+) -> i32 {
+    if paths.is_empty() {
+        return -1;
+    }
+    unsafe {
+        SetDisplayConfig(
+            Some(paths),
+            Some(active_snapshot.raw.modes.as_slice()),
+            SDC_VALIDATE | attach_flags(),
+        )
+    }
+}
+
+/// Apply a path array previously accepted by `validate_attach_paths`. Returns the raw status.
+/// NOTE: a 0 here does NOT prove any display came back — SetDisplayConfig returns 0 for a no-op
+/// on an unchanged active set. The caller must confirm against a fresh enumeration.
+pub(super) fn apply_attach_paths(
+    paths: &[DISPLAYCONFIG_PATH_INFO],
+    active_snapshot: &TopologySnapshot,
+) -> i32 {
+    if paths.is_empty() {
+        return -1;
+    }
+    unsafe {
+        SetDisplayConfig(
+            Some(paths),
+            Some(active_snapshot.raw.modes.as_slice()),
+            SDC_APPLY | attach_flags(),
+        )
+    }
+}
+
+/// Ask Windows to replay the last extended configuration from the persistence database.
+/// Returns the raw SetDisplayConfig status and always logs it — including 0, which does NOT mean
+/// the display came back: when the stored entry already matches the current topology this is a
+/// no-op that succeeds. Only the caller knows which target it is chasing, so only the caller can
+/// judge success, by observing a fresh enumeration.
+///
+/// Flag combination verified empirically with SDC_VALIDATE probes (the MSDN claim that
+/// "SDC_ALLOW_CHANGES is allowed with any other valid combination" is FALSE):
+///   EXTEND|ALLOW_CHANGES|SAVE_TO_DATABASE -> 87   (what this code used to send, always)
+///   EXTEND|ALLOW_CHANGES|PERSIST          -> 87
+///   EXTEND|ALLOW_CHANGES                  -> 87
+///   EXTEND|PERSIST                        -> flags accepted
+///   EXTEND                                -> flags accepted
+///   CLONE|ALLOW_CHANGES -> 87  vs  CLONE  -> flags accepted
+/// i.e. SDC_ALLOW_CHANGES is illegal alongside any SDC_TOPOLOGY_*, and SDC_SAVE_TO_DATABASE
+/// requires SDC_USE_SUPPLIED_DISPLAY_CONFIG (documented), which TOPOLOGY_* cannot carry.
+/// SDC_PATH_PERSIST_IF_REQUIRED matters here: a CCD detach clears the target's path persistence,
+/// and without this flag the extend would skip that display.
+pub(super) fn try_topology_extend() -> i32 {
+    let status = unsafe {
         SetDisplayConfig(
             None,
             None,
-            SDC_APPLY | SDC_TOPOLOGY_EXTEND | SDC_ALLOW_CHANGES | SDC_SAVE_TO_DATABASE,
+            SDC_APPLY | SDC_TOPOLOGY_EXTEND | SDC_PATH_PERSIST_IF_REQUIRED,
         )
     };
-    if set_display_status == 0 {
-        return Ok(());
-    }
-    diagnostics::log(format!(
-        "apply:sdc_failed:{set_display_status}:topology_extend"
-    ));
+    diagnostics::log(format!("apply:sdc_status:{status}:topology_extend"));
+    status
+}
 
-    // Some driver stacks reject direct topology-extend through SetDisplayConfig during
-    // early-login / post-reboot states. Win+P still succeeds there, so fall back to the same
-    // shell path via DisplaySwitch.
+/// Drive the same shell path Win+P uses. Escalation of last resort, decided by the caller when
+/// the CCD extend did not bring the display back.
+pub(super) fn run_display_switch_extend() -> Result<(), ManagerError> {
     let display_switch_child = Command::new("DisplaySwitch.exe")
         .creation_flags(CREATE_NO_WINDOW)
         .arg("/extend")
         .spawn()
         .map_err(|err| {
-            ManagerError::Backend(format!(
-                "SetDisplayConfig (topology extend) failed: {set_display_status}; DisplaySwitch /extend launch failed: {err}"
-            ))
+            ManagerError::Backend(format!("DisplaySwitch /extend launch failed: {err}"))
         })?;
 
     let Some(display_switch_status) = wait_child_with_timeout(
@@ -144,14 +252,14 @@ pub(super) fn force_topology_extend() -> Result<(), ManagerError> {
         "DisplaySwitch.exe",
         Duration::from_secs(10),
     ) else {
-        return Err(ManagerError::Backend(format!(
-            "SetDisplayConfig (topology extend) failed: {set_display_status}; DisplaySwitch /extend timed out"
-        )));
+        return Err(ManagerError::Backend(
+            "DisplaySwitch /extend timed out".to_string(),
+        ));
     };
 
     if !display_switch_status.success() {
         return Err(ManagerError::Backend(format!(
-            "SetDisplayConfig (topology extend) failed: {set_display_status}; DisplaySwitch /extend failed with exit code {:?}",
+            "DisplaySwitch /extend failed with exit code {:?}",
             display_switch_status.code()
         )));
     }
