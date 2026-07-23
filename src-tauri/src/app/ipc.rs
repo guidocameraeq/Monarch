@@ -1,5 +1,6 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,9 @@ use crate::app::events;
 
 const IPC_BIND_ADDR: &str = "127.0.0.1:42197";
 const IPC_IO_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_CONCURRENT_IPC_HANDLERS: usize = 8;
+
+static ACTIVE_IPC_HANDLERS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -85,8 +89,25 @@ pub fn spawn_listener<R: Runtime>(app: AppHandle<R>) {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
-                    if let Err(err) = handle_client_stream(&app, stream) {
-                        eprintln!("Monarch IPC request failed: {err}");
+                    // One thread per connection (bounded): a ShowMainWindow from a relaunch must
+                    // be served even while an earlier ApplyProfile is still blocked on the state
+                    // mutex, but a burst of sockets must not spawn unbounded threads. Above the
+                    // cap, fall back to handling the connection inline on the accept loop.
+                    if ACTIVE_IPC_HANDLERS.fetch_add(1, Ordering::SeqCst)
+                        < MAX_CONCURRENT_IPC_HANDLERS
+                    {
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            if let Err(err) = handle_client_stream(&app, stream) {
+                                eprintln!("Monarch IPC request failed: {err}");
+                            }
+                            ACTIVE_IPC_HANDLERS.fetch_sub(1, Ordering::SeqCst);
+                        });
+                    } else {
+                        ACTIVE_IPC_HANDLERS.fetch_sub(1, Ordering::SeqCst);
+                        if let Err(err) = handle_client_stream(&app, stream) {
+                            eprintln!("Monarch IPC request failed: {err}");
+                        }
                     }
                 }
                 Err(err) => {
