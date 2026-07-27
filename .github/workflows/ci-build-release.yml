@@ -139,7 +139,7 @@ jobs:
         run: yarn tauri build --bundles msi
 
       - name: Upload release artifacts
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v6
         with:
           name: monarch-windows-build-${{ needs.prepare_release.outputs.version }}
           if-no-files-found: error
@@ -159,7 +159,7 @@ jobs:
 
     steps:
       - name: Download release artifact
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: monarch-windows-build-${{ needs.prepare_release.outputs.version }}
           path: dist
