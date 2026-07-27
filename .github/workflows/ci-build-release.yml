@@ -25,7 +25,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -38,7 +38,7 @@ jobs:
           fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
 
@@ -104,12 +104,12 @@ jobs:
 
     steps:
       - name: Checkout tagged release commit
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ needs.prepare_release.outputs.commit_sha }}
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 20
           cache: yarn
